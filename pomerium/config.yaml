@@ -1,0 +1,75 @@
+# pomerium/config.yaml — Pomerium all-in-one configuration.
+#
+# Pomerium is the enforcement point: every request to a protected route passes
+# through here. It delegates authN to Keycloak (OIDC) and evaluates authZ
+# using the Rego policy below (Pomerium embeds an OPA engine internally).
+#
+# The standalone OPA container (port 8181) holds the same logic and is used
+# for unit tests and direct policy queries — it is architecturally separate
+# from Pomerium's embedded engine.
+
+# ── SHARED SECRETS ────────────────────────────────────────────────────────
+# Set via environment variables (see .env / docker-compose.yml).
+# shared_secret signs the JWT Pomerium issues between its own services.
+# cookie_secret encrypts the session cookie stored in the browser.
+shared_secret: ${POMERIUM_SHARED_SECRET}
+cookie_secret: ${POMERIUM_COOKIE_SECRET}
+
+# ── AUTHENTICATE SERVICE ──────────────────────────────────────────────────
+# Where Pomerium's own OIDC callback handler lives.
+# *.localhost.pomerium.io resolves to 127.0.0.1 via Pomerium's public DNS,
+# and Pomerium ships a bundled wildcard TLS cert for this domain — so local
+# HTTPS works out of the box with no cert management.
+authenticate_service_url: https://authenticate.localhost.pomerium.io
+
+# ── IDENTITY PROVIDER: KEYCLOAK ───────────────────────────────────────────
+# Pomerium talks to Keycloak server-side using the internal Docker hostname.
+# The browser is redirected to whatever authorization_endpoint the Keycloak
+# discovery doc advertises — which is also http://keycloak:8080 because
+# KC_HOSTNAME=keycloak in docker-compose.yml.
+# Add "127.0.0.1 keycloak" to your hosts file so browsers can reach it.
+idp_provider: oidc
+idp_provider_url: http://keycloak:8080/realms/zero-trust
+idp_client_id: pomerium
+idp_client_secret: ${POMERIUM_IDP_CLIENT_SECRET}
+
+# Request profile scope so we get name/email in the token.
+# The groups claim is added by Keycloak's protocol mapper — no extra scope needed.
+idp_scopes: [openid, profile, email]
+
+# ── ROUTES ────────────────────────────────────────────────────────────────
+routes:
+  - from: https://app.localhost.pomerium.io
+    to: http://app:80
+
+    # Forward verified identity to the upstream as signed JWT headers.
+    # The demo app (whoami) will echo X-Pomerium-Claim-Email,
+    # X-Pomerium-Claim-Groups, etc. — showing the app receives identity
+    # without needing to validate tokens itself.
+    pass_identity_headers: true
+
+    # Authorization policy — evaluated by Pomerium's embedded OPA engine.
+    # This Rego mirrors the logic in ./opa/policy.rego, but uses Pomerium's
+    # input schema: input.session.claims.* for IdP claims,
+    # input.http.headers for request headers.
+    policy:
+      - allow:
+          rego: |
+            package pomerium.policy
+            import rego.v1
+
+            # Deny unless a rule below explicitly grants access.
+            default allow := false
+
+            # Employees with a device posture signal are allowed.
+            allow if {
+              "employees" in input.session.claims.groups
+              posture := input.http.headers["x-device-posture"]
+              posture != ""
+              posture != "unknown"
+            }
+
+            # Admins are allowed regardless of device posture.
+            allow if {
+              "admins" in input.session.claims.groups
+            }

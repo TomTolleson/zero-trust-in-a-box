@@ -1,0 +1,124 @@
+---
+# zero-trust-in-a-box — full stack in one compose file.
+#
+# Request flow:
+#   Browser → Pomerium (443) → [authN: Keycloak] → [authZ: embedded OPA]
+#            → app (internal only, never exposed directly)
+#
+# The standalone OPA container (8181) mirrors the same policies for unit
+# testing and direct API queries.  It is NOT in the hot path — Pomerium
+# uses its own embedded OPA engine for real-time enforcement.
+#
+# Usage:
+#   cp .env.example .env          # fill in generated secrets
+#   echo "127.0.0.1 keycloak" | sudo tee -a /etc/hosts   # once, see README
+#   docker compose up
+
+name: zero-trust-in-a-box
+
+networks:
+  zero-trust:
+    driver: bridge
+
+services:
+
+  # ── IDENTITY PROVIDER ─────────────────────────────────────────────────────
+  # Keycloak issues OIDC tokens after a user logs in.
+  # It is the source of truth for identity (who you are).
+  # Authorization (what you may do) is decided by OPA, not Keycloak.
+  keycloak:
+    image: quay.io/keycloak/keycloak:24.0.5
+    # start-dev: single-node, in-memory H2 DB — fine for demos.
+    # --import-realm: loads realm-export.json on first startup only.
+    # --health-enabled=true: exposes /health/ready for the healthcheck.
+    command: start-dev --import-realm --health-enabled=true
+    environment:
+      KC_BOOTSTRAP_ADMIN_USERNAME: admin
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:-admin}
+      # Use "keycloak" as the hostname so that tokens contain
+      # iss: http://keycloak:8080/... — matching both the internal Docker
+      # network name and the hosts-file entry browsers use.
+      KC_HOSTNAME: keycloak
+      KC_HOSTNAME_STRICT: "false"
+      KC_HOSTNAME_STRICT_HTTPS: "false"
+      KC_HTTP_ENABLED: "true"
+    volumes:
+      - ./keycloak/realm-export.json:/opt/keycloak/data/import/realm-export.json:ro
+    ports:
+      # Exposed so browsers can complete the OIDC login redirect.
+      # After adding "127.0.0.1 keycloak" to your hosts file, browsers
+      # reach Keycloak at http://keycloak:8080 — same hostname Pomerium uses.
+      - "8080:8080"
+    networks:
+      - zero-trust
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health/ready || exit 1"]
+      interval: 15s
+      timeout: 10s
+      retries: 20
+      start_period: 90s  # Keycloak takes ~60–90 s to fully start
+
+  # ── POLICY ENGINE ─────────────────────────────────────────────────────────
+  # Standalone OPA for unit tests and direct API queries.
+  # This is NOT the OPA instance that enforces requests — Pomerium embeds
+  # its own OPA engine.  Running OPA separately lets you:
+  #   1. Run "opa test" to validate policies before deploying.
+  #   2. Query policies via HTTP for non-Pomerium services.
+  #   3. Inspect decision logs at http://localhost:8181/v1/data
+  opa:
+    image: openpolicyagent/opa:0.68.0
+    # --server: run as an HTTP API server (not one-shot eval)
+    # --log-format=json-pretty: structured logs, easy to parse
+    command: run --server --log-level=info --log-format=json-pretty /policies
+    volumes:
+      - ./opa:/policies:ro
+    ports:
+      - "8181:8181"  # OPA HTTP API — try GET http://localhost:8181/health
+    networks:
+      - zero-trust
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8181/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # ── ENFORCEMENT POINT ─────────────────────────────────────────────────────
+  # Pomerium sits in front of every protected resource.
+  # No request reaches the app without passing Pomerium's authN + authZ checks.
+  # It delegates authN to Keycloak (OIDC) and evaluates authZ using the
+  # inline Rego policy in pomerium/config.yaml.
+  pomerium:
+    image: pomerium/pomerium:v0.26.1
+    volumes:
+      - ./pomerium/config.yaml:/pomerium/config.yaml:ro
+    environment:
+      # Pomerium expands ${VAR} references in config.yaml from the environment.
+      POMERIUM_SHARED_SECRET: ${POMERIUM_SHARED_SECRET}
+      POMERIUM_COOKIE_SECRET: ${POMERIUM_COOKIE_SECRET}
+      POMERIUM_IDP_CLIENT_SECRET: ${POMERIUM_IDP_CLIENT_SECRET}
+    ports:
+      - "80:80"    # HTTP (redirect to HTTPS)
+      - "443:443"  # HTTPS — visit https://app.localhost.pomerium.io
+    networks:
+      - zero-trust
+    depends_on:
+      keycloak:
+        condition: service_healthy
+      opa:
+        condition: service_healthy
+    # On Linux Docker (not Docker Desktop), containers cannot reach the host
+    # via host.docker.internal by default.  This extra_hosts entry maps it.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+
+  # ── PROTECTED RESOURCE ────────────────────────────────────────────────────
+  # traefik/whoami echoes back everything: method, host, headers.
+  # This makes it easy to verify that Pomerium attached identity headers
+  # (X-Pomerium-Claim-Email, X-Pomerium-Claim-Groups, etc.) to the request.
+  # No ports are exposed — it is only reachable through Pomerium.
+  app:
+    image: traefik/whoami:latest
+    networks:
+      - zero-trust
+    # Intentionally no "ports:" block.
+    # Direct access is impossible; the only path in is through Pomerium.

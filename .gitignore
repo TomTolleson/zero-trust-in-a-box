@@ -1,0 +1,7 @@
+# Never commit real secrets
+.env
+
+# OS / editor noise
+.DS_Store
+Thumbs.db
+*.swp
